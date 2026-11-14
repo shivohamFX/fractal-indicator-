@@ -1,6 +1,6 @@
 //@version=6
-import fstarcapital/AssetCorrelationUtils/13 as ACL
-indicator('shivoham fractal° [Pro+]', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+indicator('shivoham fractal° [Pro+]', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000, calc_bars_count = 2000)
 
 // ============================================================================
 // Types - Data Only (no drawing objects stored)
@@ -44,6 +44,23 @@ type ICCisd
     float extreme_price
     int extreme_idx
     bool taken               // wick beyond swing high/low — line and dot go grey
+
+// T-Spot zone data (one per entry zone: C3 and C4)
+type TSpot
+    bool bull
+    float htf_open
+    float eq
+    float eq_top
+    float eq_bot
+    float cisd_open
+    float cisd50
+    float cisd_top
+    float cisd_bot
+    float top
+    float bot
+    bool overlap
+    int state                // 0 = ACTIVE, 1 = TOUCHED, 2 = CONFIRMED
+    int ic_base              // IC-CISD count at the moment of the touch
 
 type Setup
     bool is_bullish          // true = bullish setup (low sweep), false = bearish (high sweep)
@@ -97,12 +114,17 @@ type Setup
     bool is_invalid          // True if C3 exceeded C2 extreme after CISD triggered
     // Entry Zone C3 data
     float c2_mid             // C2 wick midpoint (high+low)/2
+    float c2_open            // C2 open (T-Spot EQ rules)
+    float c2_close           // C2 close (T-Spot EQ rules)
+    float c2_h               // C2 high (T-Spot EQ rules)
+    float c2_l               // C2 low (T-Spot EQ rules)
     float c3_open            // C3 open price
     bool ez_c3_set           // true when C3 entry zone bounds are calculated
     float ez_c3_top          // C3 zone top price
     float ez_c3_bot          // C3 zone bottom price
     int ez_c3_left_time      // C3 zone left (C3 open time)
     int ez_c3_right_time     // C3 zone right (C3 close / C4 open); na while C3 is live
+    TSpot ts3                // C3 T-Spot construction data
     // Entry Zone C4 data
     float c3_mid             // C3 wick midpoint (high+low)/2
     float c3_extreme         // C3 high (bearish) or low (bullish) for C4 invalidation
@@ -114,6 +136,7 @@ type Setup
     float ez_c4_bot          // C4 zone bottom price
     int ez_c4_left_time      // C4 zone left (C4 open time)
     int ez_c4_right_time     // C4 zone right (C4 close)
+    TSpot ts4                // C4 T-Spot construction data
     // SMT data (C1-C2)
     bool has_smt             // SMT detected for this setup (C1-C2)
     int smt_x1               // SMT line start bar index
@@ -323,15 +346,22 @@ var array<float> proj_deviations = array.new_float()
 // Settings Inputs
 // ============================================================================
 
+string group_alerts             = "Alerts Settings  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 string group_general            = "General Settings  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 string group_htf               = "HTF Candles  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 string group_sweep              = "Model Settings  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 string group_label              = "Label Settings  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 string group_imbalance          = "Imbalance  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-// General Settings
-alerts_enabled_input            = input.bool(true, 'Alerts?', group=group_general, tooltip='To turn on the alerts, follow these steps:\n\n1) Make sure that the Alerts? toggle is ON.\n2) Right-click on the indicator on your chart.\n3) Click Add Alert on this indicator.\n4) Choose the Alert Name and confirm by clicking Create.\n\nNOTE: if you change any Settings, delete and re-create the alerts!')
+// Alerts Settings
+alerts_enabled_input            = input.bool(true, 'Alerts?', group=group_alerts, tooltip="Master switch for every alert of this indicator.\n\nTo create one: click the three dots next to the indicator name (or right-click it on the chart) > Add alert > Create. Condition: Any alert() function call. Alerts keep the settings they were created with; after changing these, create the alert again.")
 settings.alerts_enabled         := alerts_enabled_input
+model_alerts_input              = input.bool(true, 'Model Candles?', group=group_alerts, tooltip='A full model: a C2 closure with its CISD, or its continuation. The alert says Candle 2 or Candle 4.')
+settings.live_alerts_enabled    := input.bool(false, 'Early CISD?', group=group_alerts, tooltip='A CISD before the HTF candle has closed. The alert says Potential Candle 2.')
+smt_alerts_input                = input.bool(true, 'SMT Divergence?', group=group_alerts, tooltip='A correlated pair disagrees with this symbol (SMT) while a model runs.')
+settings.ic_cisd_alerts         := input.bool(true, 'Protected Swings?', group=group_alerts, tooltip='A new protected swing (IC-CISD) after the reversal CISD.')
+
+// General Settings
 settings.sweep_history          := input.int(10, 'History        ', minval=0, group=group_general, inline='history')
 settings.sweep_visible_only     := input.bool(true, '', tooltip='Number of historical setups to show:\n\n☑ ON: Setups on visible HTF candles always shown. This count adds older setups that scrolled away.\n\n☐ OFF: Only show this many setups total.', inline='history', group=group_general)
 // ADDED: '90m-6H' and '15m-7H' in the options list below
@@ -468,7 +498,6 @@ drawings_type                  = input.string('Both', 'Drawings Type', options=[
 sweep_show_input                = input.bool(true, 'Show Sweeps   ', group=group_sweep, inline='sweep')
 settings.sweep_show             := sweep_show_input
 settings.sweep_live             := input.bool(true, 'Show live setup', inline='sweep_live', group=group_sweep, active = sweep_show_input)
-settings.live_alerts_enabled    := input.bool(true, 'Alert', inline='sweep_live', group=group_sweep, active = sweep_show_input and alerts_enabled_input, tooltip='Send "Potential" alerts when CISD triggers during live setup tracking')
 settings.sweep_color            := input.color(color.rgb(0, 0, 0, 0), 'Color         ', inline='sweep_color', group=group_sweep, active = sweep_show_input)
 settings.sweep_style            := input.string('Solid', '', options=['Solid', 'Dashed', 'Dotted'], inline='sweep_color', group=group_sweep, active = sweep_show_input)
 settings.sweep_size             := input.int(1, '', options=[1, 2, 3, 4], inline='sweep_color', group=group_sweep, active = sweep_show_input)
@@ -482,7 +511,6 @@ settings.cisd_show              := cisd_show_input
 ic_cisd_show_input              = input.bool(true, 'IC-CISD', inline='cisd', group=group_sweep, tooltip='Same-side IC-CISD after main CISD confirm through C4 (stops on setup or C4 invalid). Uses CISD colors/width/style. Extreme marked with a dot.')
 settings.ic_cisd_show           := ic_cisd_show_input
 settings.ic_dot_size            := input.string(size.tiny, 'Dot', options=[size.tiny, size.small, size.normal, size.large], inline='cisd', group=group_sweep, active = ic_cisd_show_input)
-settings.ic_cisd_alerts         := input.bool(true, 'Alert', inline='cisd', group=group_sweep, active = ic_cisd_show_input)
 settings.cisd_bull_color        := input.color(color.rgb(41,98,255), 'Bull          ', inline='cisd_color', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
 settings.cisd_bear_color        := input.color(color.rgb(242,54,69), 'Bear', inline='cisd_color', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
 settings.cisd_width             := input.int(2, 'Width', options=[1, 2, 3, 4], inline='cisd_style', group=group_sweep, active = cisd_show_input or ic_cisd_show_input)
@@ -491,6 +519,7 @@ entry_zone_show_input           = input.bool(true, 'Entry Zone   ', inline='entr
 settings.entry_zone_show        := entry_zone_show_input
 settings.entry_zone_bull_color  := input.color(color.new(color.rgb(41, 98, 255), 96), 'Bullish', inline='entry_zone', group=group_sweep, active = entry_zone_show_input)
 settings.entry_zone_bear_color  := input.color(color.new(color.rgb(242, 54, 69), 96), 'Bearish', inline='entry_zone', group=group_sweep, active = entry_zone_show_input)
+tspot_debug                     = input.bool(false, 'T-Spot Debug', group=group_sweep, active = entry_zone_show_input, tooltip='Shows a label on each entry zone (T-Spot) with direction, state, HTF open, EQ, EQ zone, CISD 50%, CISD zone, overlap and the final T-Spot bounds.')
 
 // Standard Deviation Projections
 string group_projection         = "Standard Deviation Projections  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -526,7 +555,6 @@ string group_smt                = "SMT Divergence  ━━━━━━━━━�
 smt_show_input                  = input.bool(true, 'SMT', inline='smt_top', group=group_smt)
 smt_label_show_input            = input.bool(true, 'Label', inline='smt_top', group=group_smt, active = smt_show_input)
 smt_label_size_input            = input.string('Small', '', options=['Tiny', 'Small', 'Normal', 'Large'], inline='smt_top', group=group_smt, active = smt_show_input and smt_label_show_input)
-smt_alerts_input                = input.bool(true, 'Alerts', inline='smt_top', group=group_smt, active = smt_show_input)
 smt_color_input                 = input.color(color.rgb(156, 39, 176), '', inline='smt_line', group=group_smt, active = smt_show_input)
 smt_line_style_input            = input.string('Solid', '', options=['Solid', 'Dashed', 'Dotted'], inline='smt_line', group=group_smt, active = smt_show_input)
 smt_line_width_input            = input.int(1, 'Width', options=[1, 2, 3, 4], inline='smt_line', group=group_smt, active = smt_show_input)
@@ -539,20 +567,191 @@ smt_sym1_inverse_input          = input.bool(false, 'Inverse ?', inline='smt_sym
 smt_sym2_manual_input           = input.symbol('CME_MINI:NQ1!', '2.', inline='smt_sym2', group=group_smt, active = smt_show_input and smt_mode_input == 'Manual' and smt_sym2_enable_input)
 smt_sym2_inverse_input          = input.bool(false, 'Inverse ?', inline='smt_sym2', group=group_smt, active = smt_show_input and smt_mode_input == 'Manual' and smt_sym2_enable_input)
 // [SMT3] Symbol 3 (always manual — the ACL library only provides secondary/tertiary)
-smt_sym3_enable_input           = input.bool(false, 'Enable Third SMT?', inline='smt_mode3', group=group_smt, active = smt_show_input)
+smt_sym3_enable_input           = input.bool(true, 'Enable Third SMT?', inline='smt_mode3', group=group_smt, active = smt_show_input)
 smt_sym3_manual_input           = input.symbol('CBOT_MINI:YM1!', '3.', inline='smt_sym3', group=group_smt, active = smt_show_input and smt_sym3_enable_input)
 smt_sym3_inverse_input          = input.bool(false, 'Inverse ?', inline='smt_sym3', group=group_smt, active = smt_show_input and smt_sym3_enable_input)
 
-// SMT Symbol Resolution using library
-acl_config                      = ACL.resolveCurrentChart()
-smt_sym1_resolved               = smt_mode_input == 'Automatic' ? acl_config.secondary : smt_sym1_manual_input
-smt_sym2_resolved               = smt_mode_input == 'Automatic' ? acl_config.tertiary : smt_sym2_manual_input
-smt_sym1_inverse                = smt_mode_input == 'Automatic' ? acl_config.invertSecondary : smt_sym1_inverse_input
-smt_sym2_inverse                = smt_mode_input == 'Automatic' ? acl_config.invertTertiary : smt_sym2_inverse_input
-// [SMT3]
-smt_sym3_resolved               = smt_sym3_manual_input
-smt_sym3_inverse                = smt_sym3_inverse_input
+// DXY sits in two forex triads, so when the chart IS the DXY this picks which pair to use. Ignored for every other symbol.
+smt_dxy_triad_input = input.string('EURUSD + GBPUSD', 'DXY Auto Pair', options = ['EURUSD + GBPUSD', 'AUDUSD + NZDUSD'], inline = 'smt_dxy', group = group_smt, tooltip = 'Automatic mode only, and only when the chart itself is the DXY: which forex triad to compare against.', active = smt_show_input)
 
+// ============================================================================
+// SMT Symbol Resolution - triads, gold quad, index CFDs vs futures
+// ============================================================================
+// 1) normalise the chart to a logical instrument (provider prefix ignored)
+// 2) the other members of that exact group become the comparison symbols
+// 3) each member is mapped to its preferred provider (fallback only where one is defined)
+// 4) inverse flag = exactly one side of the pair is the DXY
+
+type AclConfig
+    string secondary
+    string tertiary
+    string third
+    bool invertSecondary
+    bool invertTertiary
+    bool invertThird
+    string secondaryFb
+    string tertiaryFb
+    string thirdFb
+
+smtInList(string s, string csv) =>
+    str.contains("," + csv + ",", "," + s + ",")
+
+// Logical instrument of the chart. Futures are matched by root and only when the symbol is a future,
+// so NQ1! never gets confused with the NAS100 CFD (and vice versa).
+smtLogicalKey() =>
+    string r = str.upper(syminfo.root)
+    string t = str.upper(syminfo.ticker)
+    string k = ""
+    if syminfo.type == "futures"
+        if smtInList(r, "NQ,MNQ")
+            k := "FNQ"
+        else if smtInList(r, "ES,MES")
+            k := "FES"
+        else if smtInList(r, "YM,MYM")
+            k := "FYM"
+    else if smtInList(t, "EURUSD")
+        k := "EURUSD"
+    else if smtInList(t, "GBPUSD")
+        k := "GBPUSD"
+    else if smtInList(t, "AUDUSD")
+        k := "AUDUSD"
+    else if smtInList(t, "NZDUSD")
+        k := "NZDUSD"
+    else if smtInList(t, "DXY,USDX,USDOLLAR")
+        k := "DXY"
+    else if smtInList(t, "NAS100")
+        k := "NAS100"
+    else if smtInList(t, "US30")
+        k := "US30"
+    else if smtInList(t, "SP500")
+        k := "SP500"
+    else if smtInList(t, "USOIL,WTICOUSD,XTIUSD")
+        k := "USOIL"
+    else if smtInList(t, "RBOBGASOLINE,RBOB,GASOLINE")
+        k := "RBOB"
+    else if smtInList(t, "HEATINGOIL,HEATOIL")
+        k := "HEAT"
+    else if smtInList(t, "XAUUSD,GOLD")
+        k := "XAUUSD"
+    else if smtInList(t, "XAGUSD,SILVER")
+        k := "XAGUSD"
+    else if smtInList(t, "XAUEUR")
+        k := "XAUEUR"
+    else if smtInList(t, "XAUGBP")
+        k := "XAUGBP"
+    k
+
+// The other two members. Index CFDs compare against futures; everything else is a symmetric triad.
+smtOther(string key, bool second, bool dxyAus) =>
+    switch key
+        "EURUSD" => second ? "DXY" : "GBPUSD"
+        "GBPUSD" => second ? "DXY" : "EURUSD"
+        "AUDUSD" => second ? "DXY" : "NZDUSD"
+        "NZDUSD" => second ? "DXY" : "AUDUSD"
+        "DXY"    => dxyAus ? (second ? "NZDUSD" : "AUDUSD") : (second ? "GBPUSD" : "EURUSD")
+        "NAS100" => second ? "FES" : "FYM"
+        "SP500"  => second ? "FNQ" : "FYM"
+        "US30"   => second ? "FES" : "FNQ"
+        "FNQ"    => second ? "FYM" : "FES"
+        "FES"    => second ? "FYM" : "FNQ"
+        "FYM"    => second ? "FES" : "FNQ"
+        "USOIL"  => second ? "HEAT" : "RBOB"
+        "RBOB"   => second ? "HEAT" : "USOIL"
+        "HEAT"   => second ? "RBOB" : "USOIL"
+        => ""
+
+// Gold quad: the other three members of the 4-symbol group. Returns "" for any non-gold key.
+smtOtherQuad(string key, int slot) =>
+    switch key
+        "XAUUSD" => slot == 1 ? "XAGUSD" : slot == 2 ? "XAUEUR" : "XAUGBP"
+        "XAGUSD" => slot == 1 ? "XAUUSD" : slot == 2 ? "XAUEUR" : "XAUGBP"
+        "XAUEUR" => slot == 1 ? "XAUUSD" : slot == 2 ? "XAGUSD" : "XAUGBP"
+        "XAUGBP" => slot == 1 ? "XAUUSD" : slot == 2 ? "XAGUSD" : "XAUEUR"
+        => ""
+
+// Preferred provider symbol per logical instrument
+smtPrimary(string key) =>
+    switch key
+        "EURUSD" => "FOREXCOM:EURUSD"
+        "GBPUSD" => "FOREXCOM:GBPUSD"
+        "AUDUSD" => "FOREXCOM:AUDUSD"
+        "NZDUSD" => "FOREXCOM:NZDUSD"
+        "DXY"    => "FOREXCOM:USDX"
+        "NAS100" => "FXCM:NAS100"
+        "US30"   => "FXCM:US30"
+        "SP500"  => "VANTAGE:SP500"
+        "FNQ"    => "CME_MINI:NQ1!"
+        "FES"    => "CME_MINI:ES1!"
+        "FYM"    => "CBOT_MINI:YM1!"
+        "USOIL"  => "FOREXCOM:USOIL"
+        "RBOB"   => "CMCMARKETS:RBOBGASOLINE"
+        "HEAT"   => "CAPITALCOM:HEATINGOIL"
+        "XAUUSD" => "FOREXCOM:XAUUSD"
+        "XAGUSD" => "FOREXCOM:XAGUSD"
+        "XAUEUR" => "FOREXCOM:XAUEUR"
+        "XAUGBP" => "FOREXCOM:XAUGBP"
+        => ""
+
+// Used only when the preferred symbol returns no data. Indices, oil and gold have none on purpose.
+smtFallback(string key) =>
+    switch key
+        "EURUSD" => "FXCM:EURUSD"
+        "GBPUSD" => "FXCM:GBPUSD"
+        "AUDUSD" => "FXCM:AUDUSD"
+        "NZDUSD" => "FXCM:NZDUSD"
+        "DXY"    => "FXCM:USDOLLAR"
+        "FNQ"    => "CME:NQ1!"
+        "FES"    => "CME:ES1!"
+        "FYM"    => "CBOT:YM1!"
+        => ""
+
+// A pair is inverse exactly when one side is the DXY (symmetric: DXY vs EURUSD is inverse from either chart)
+smtInverse(string a, string b) =>
+    (a == "DXY") != (b == "DXY")
+
+resolveCurrentChart() =>
+    AclConfig c = AclConfig.new("", "", "", false, false, false, "", "", "")
+    string key = smtLogicalKey()
+    if key != ""
+        bool dxyAus = smt_dxy_triad_input == 'AUDUSD + NZDUSD'
+        bool isQuad = smtOtherQuad(key, 1) != ""
+        string o1 = isQuad ? smtOtherQuad(key, 1) : smtOther(key, false, dxyAus)
+        string o2 = isQuad ? smtOtherQuad(key, 2) : smtOther(key, true, dxyAus)
+        string o3 = isQuad ? smtOtherQuad(key, 3) : ""
+        c.secondary := smtPrimary(o1)
+        c.secondaryFb := smtFallback(o1)
+        c.invertSecondary := smtInverse(key, o1)
+        c.tertiary := smtPrimary(o2)
+        c.tertiaryFb := smtFallback(o2)
+        c.invertTertiary := smtInverse(key, o2)
+        c.third := smtPrimary(o3)
+        c.thirdFb := smtFallback(o3)
+        c.invertThird := smtInverse(key, o3)
+    c
+
+// Keeps the preferred provider; the fallback is used only while the preferred symbol has returned no data.
+smtPickProvider(string primary, string fallback, bool active) =>
+    var bool primary_ok = false
+    string picked = primary
+    if active and primary != "" and fallback != ""
+        float probe = request.security(primary, "D", close, ignore_invalid_symbol = true)
+        if not na(probe)
+            primary_ok := true
+        picked := primary_ok ? primary : fallback
+    picked
+
+acl_config        = resolveCurrentChart()
+bool smt_auto     = smt_mode_input == 'Automatic'
+auto_sym1         = smtPickProvider(acl_config.secondary, acl_config.secondaryFb, smt_auto)
+auto_sym2         = smtPickProvider(acl_config.tertiary, acl_config.tertiaryFb, smt_auto)
+auto_sym3         = smtPickProvider(acl_config.third, acl_config.thirdFb, smt_auto)
+
+smt_sym1_resolved = smt_auto ? auto_sym1 : smt_sym1_manual_input
+smt_sym2_resolved = smt_auto ? auto_sym2 : smt_sym2_manual_input
+smt_sym3_resolved = smt_auto ? auto_sym3 : smt_sym3_manual_input
+smt_sym1_inverse  = smt_auto ? acl_config.invertSecondary : smt_sym1_inverse_input
+smt_sym2_inverse  = smt_auto ? acl_config.invertTertiary : smt_sym2_inverse_input
+smt_sym3_inverse  = smt_auto ? acl_config.invertThird : smt_sym3_inverse_input
 // Dynamic requests in Pine v6 execute only in the enabled branch. This avoids
 // loading comparison feeds when SMT is off and skips symbol 2 when disabled.
 GetSmtData(string symbol, bool enabled) =>
@@ -600,6 +799,41 @@ settings.dow_position           := input.string('Bottom', 'Pos', options=['Both'
 fvg_show_input                  = input.bool(true, 'Fair Value Gap', group = group_imbalance, inline = 'fvg')
 settings.fvg_show               := fvg_show_input
 settings.fvg_color              := input.color(color.new(color.gray, 80), '', inline = 'fvg', group = group_imbalance, active = fvg_show_input)
+
+// ============================================================================
+// Time Filter (new setups only inside the checked windows)
+// ============================================================================
+string group_tf               = "Time Filter  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+useTimeFilter                 = input.bool(false, 'Enable Time Filter?', group = group_tf, tooltip = 'New setups only when the model is found inside one of the checked windows (checked when C2 closes, i.e. when C3 opens). With no window checked, nothing is filtered.')
+tfApplyBelow                  = input.timeframe('60', 'Apply below', group = group_tf, active = useTimeFilter, tooltip = 'Only charts below this timeframe are filtered.')
+tfUseTz                       = input.bool(false, 'Custom Timezone? UTC', group = group_tf, inline = 'tftz', active = useTimeFilter)
+tfTzHour                      = input.int(1, '', minval = -12, maxval = 14, group = group_tf, inline = 'tftz', active = useTimeFilter and tfUseTz)
+tfTzMin                       = input.int(0, ':', minval = 0, maxval = 59, group = group_tf, inline = 'tftz', active = useTimeFilter and tfUseTz, tooltip = 'Off: the windows are New York time.')
+f1On                          = input.bool(false, 'Filter 1', group = group_tf, inline = 'f1', active = useTimeFilter)
+f1Sess                        = input.session('0200-0500', '', group = group_tf, inline = 'f1', active = useTimeFilter)
+f2On                          = input.bool(false, 'Filter 2', group = group_tf, inline = 'f2', active = useTimeFilter)
+f2Sess                        = input.session('0800-1100', '', group = group_tf, inline = 'f2', active = useTimeFilter)
+f3On                          = input.bool(false, 'Filter 3', group = group_tf, inline = 'f3', active = useTimeFilter)
+f3Sess                        = input.session('1330-1615', '', group = group_tf, inline = 'f3', active = useTimeFilter)
+
+pad2(int v) =>
+    v < 10 ? '0' + str.tostring(v) : str.tostring(v)
+
+// UTC offset as a Pine timezone string, e.g. GMT+0300
+gmtString(int h, int m) =>
+    'GMT' + (h < 0 ? '-' : '+') + pad2(math.abs(h)) + pad2(m)
+
+string filterTz = tfUseTz ? gmtString(tfTzHour, tfTzMin) : 'America/New_York'
+
+inWindow(string sess) =>
+    not na(time(timeframe.period, sess, filterTz))
+
+bool win1 = inWindow(f1Sess)
+bool win2 = inWindow(f2Sess)
+bool win3 = inWindow(f3Sess)
+
+bool timeFilterActive = useTimeFilter and (f1On or f2On or f3On) and timeframe.in_seconds() < timeframe.in_seconds(tfApplyBelow)
+bool inTimeFilter     = not timeFilterActive or (f1On and win1) or (f2On and win2) or (f3On and win3)
 
 // ============================================================================
 // Helper Functions
@@ -739,20 +973,93 @@ GetCisdBodyRange(int cisd_start_idx, int extreme_bar_idx) =>
     float body_mid = not na(body_hi) and not na(body_lo) ? (body_hi + body_lo) / 2.0 : na
     [body_lo, body_hi, body_mid]
 
-// Set C3 entry zone once: if C2 mid inside CISD body → C2 mid↔body mid; else C2 mid↔C3 open
+// ——— T-Spot construction ———
+// EQ zone  = HTF open ↔ EQ (EQ must sit on the correct side of the open)
+// CISD zone = CISD open (opposing series open) ↔ CISD 50% (mid of the series bodies)
+// Overlap  -> T-Spot runs from the HTF open to the far edge of the overlap
+// No overlap -> T-Spot = EQ zone
+// Bullish T-Spot stays at/below the HTF open, bearish at/above it. Returns na if invalid.
+MakeTSpot(bool bull, float htf_open, float eq, float cisd_open, float cisd50) =>
+    TSpot t = na
+    if not na(htf_open) and not na(eq) and (bull ? eq < htf_open : eq > htf_open)
+        float eq_top = math.max(htf_open, eq)
+        float eq_bot = math.min(htf_open, eq)
+        bool has_c = not na(cisd_open) and not na(cisd50)
+        float c_top = has_c ? math.max(cisd_open, cisd50) : na
+        float c_bot = has_c ? math.min(cisd_open, cisd50) : na
+        float ov_top = has_c ? math.min(eq_top, c_top) : na
+        float ov_bot = has_c ? math.max(eq_bot, c_bot) : na
+        float t_top = eq_top
+        float t_bot = eq_bot
+        bool overlap = false
+        if has_c and ov_top >= ov_bot
+            float o_top = bull ? htf_open : ov_top
+            float o_bot = bull ? ov_bot : htf_open
+            if o_top > o_bot
+                t_top := o_top
+                t_bot := o_bot
+                overlap := true
+        t := TSpot.new()
+        t.bull := bull
+        t.htf_open := htf_open
+        t.eq := eq
+        t.eq_top := eq_top
+        t.eq_bot := eq_bot
+        t.cisd_open := cisd_open
+        t.cisd50 := cisd50
+        t.cisd_top := c_top
+        t.cisd_bot := c_bot
+        t.top := t_top
+        t.bot := t_bot
+        t.overlap := overlap
+        t.state := 0
+        t.ic_base := 0
+    t
+
+// State tracking: ACTIVE -> TOUCHED (price trades into the zone) -> CONFIRMED (a new IC-CISD after the touch)
+TSpotTrackOne(TSpot t, Setup setup, int left_time, int right_time) =>
+    if not na(t) and not na(left_time) and time >= left_time and (na(right_time) or time < right_time)
+        if t.state == 0
+            bool touched = t.bull ? low <= t.top : high >= t.bot
+            if touched
+                t.state := 1
+                t.ic_base := na(setup.ic_list) ? 0 : setup.ic_list.size()
+        else if t.state == 1
+            int n_ic = na(setup.ic_list) ? 0 : setup.ic_list.size()
+            if n_ic > t.ic_base
+                t.state := 2
+    true
+
+TSpotTrack(Setup setup) =>
+    if not setup.is_invalid
+        TSpotTrackOne(setup.ts3, setup, setup.ez_c3_left_time, setup.ez_c3_right_time)
+        if not setup.ez_c4_invalid
+            TSpotTrackOne(setup.ts4, setup, setup.ez_c4_left_time, setup.ez_c4_right_time)
+    setup
+
+TSpotDebugText(TSpot t, string zname) =>
+    string st = t.state == 2 ? "CONFIRMED" : t.state == 1 ? "TOUCHED" : "ACTIVE"
+    string cz = na(t.cisd_top) ? "n/a" : str.tostring(t.cisd_bot, format.mintick) + " - " + str.tostring(t.cisd_top, format.mintick)
+    zname + " " + (t.bull ? "BULLISH" : "BEARISH") + " | " + st + "\nOpen: " + str.tostring(t.htf_open, format.mintick) + "\nEQ: " + str.tostring(t.eq, format.mintick) + "\nEQ Zone: " + str.tostring(t.eq_bot, format.mintick) + " - " + str.tostring(t.eq_top, format.mintick) + "\nCISD 50: " + (na(t.cisd50) ? "n/a" : str.tostring(t.cisd50, format.mintick)) + "\nCISD Zone: " + cz + "\nOverlap: " + (t.overlap ? "YES" : "NO") + "\nT-Spot: " + str.tostring(t.bot, format.mintick) + " - " + str.tostring(t.top, format.mintick)
+
+// Set C3 T-Spot once (entry zone for C3). HTF open = C3 open.
+// EQ: C2 closes against the swing -> close ↔ extreme wick; C2 closes with the swing -> full C2 range.
 TrySetEntryZoneC3(Setup setup) =>
-    if not setup.ez_c3_set and not setup.is_invalid and setup.is_post_c2 and setup.cisd_triggered and not na(setup.c2_mid) and not na(setup.c3_open) and not na(setup.cisd_start_idx) and not na(setup.extreme_bar_idx)
+    if not setup.ez_c3_set and not setup.is_invalid and setup.is_post_c2 and setup.cisd_triggered and not na(setup.c2_h) and not na(setup.c2_l) and not na(setup.c2_open) and not na(setup.c2_close) and not na(setup.c3_open) and not na(setup.cisd_start_idx) and not na(setup.extreme_bar_idx)
+        bool bull = setup.is_bullish
+        bool against = bull ? setup.c2_close < setup.c2_open : setup.c2_close > setup.c2_open
+        float eq = against ? (bull ? (setup.c2_close + setup.c2_l) / 2.0 : (setup.c2_close + setup.c2_h) / 2.0) : (setup.c2_h + setup.c2_l) / 2.0
         [body_lo, body_hi, body_mid] = GetCisdBodyRange(setup.cisd_start_idx, setup.extreme_bar_idx)
-        if not na(body_lo) and not na(body_hi) and not na(body_mid)
-            float c2m = setup.c2_mid
-            bool inside = c2m >= body_lo and c2m <= body_hi
-            float y2 = inside ? body_mid : setup.c3_open
-            setup.ez_c3_top := math.max(c2m, y2)
-            setup.ez_c3_bot := math.min(c2m, y2)
+        TSpot t3 = MakeTSpot(bull, setup.c3_open, eq, setup.cisd_level, body_mid)
+        if not na(t3)
+            setup.ts3 := t3
+            setup.ez_c3_top := t3.top
+            setup.ez_c3_bot := t3.bot
             setup.ez_c3_set := true
     setup
 
-// At C3 close / C4 open: always store C3 mid + C4 span (for Previous EQ); entry-zone box only if enabled
+// At C3 close / C4 open: always store C3 mid + C4 span (for Previous EQ); C4 T-Spot only if valid
+// C4: EQ = full C3 range midpoint, HTF open = C4 open; CISD overlap only if it really exists (usually EQ-only)
 TrySetEntryZoneC4(Setup setup, float c3_h, float c3_l, float c4_open_price, int left_time, int right_time) =>
     if not setup.is_invalid and not na(c3_h) and not na(c3_l) and not na(c4_open_price)
         float c3m = (c3_h + c3_l) / 2.0
@@ -762,10 +1069,17 @@ TrySetEntryZoneC4(Setup setup, float c3_h, float c3_l, float c4_open_price, int 
         setup.ez_c4_left_time := left_time
         setup.ez_c4_right_time := right_time
         if not setup.ez_c4_set
-            setup.ez_c4_top := math.max(c3m, c4_open_price)
-            setup.ez_c4_bot := math.min(c3m, c4_open_price)
-            setup.ez_c4_set := true
-            setup.ez_c4_invalid := false
+            float cisd50_c4 = na
+            if not na(setup.cisd_start_idx) and not na(setup.extreme_bar_idx)
+                [b4_lo, b4_hi, b4_mid] = GetCisdBodyRange(setup.cisd_start_idx, setup.extreme_bar_idx)
+                cisd50_c4 := b4_mid
+            TSpot t4 = MakeTSpot(setup.is_bullish, c4_open_price, c3m, setup.cisd_level, cisd50_c4)
+            if not na(t4)
+                setup.ts4 := t4
+                setup.ez_c4_top := t4.top
+                setup.ez_c4_bot := t4.bot
+                setup.ez_c4_set := true
+                setup.ez_c4_invalid := false
     setup
 
 // Right edge for entry zone / EQ: grows with each LTF bar; once period ends, locks at final edge
@@ -980,6 +1294,7 @@ ICMarkTaken(Setup setup) =>
     setup
 
 ICUpdate(Setup setup) =>
+    TSpotTrack(setup)
     ICMarkTaken(setup)
     if not settings.ic_cisd_show
         setup
@@ -1635,7 +1950,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.proj_anchor_1 := math.max(open[extreme_lookback], close[extreme_lookback])
                         setup.proj_anchor_0 := math.min(open[cisd_lookback], close[cisd_lookback])
                     // Live/Potential alert for bearish CISD trigger
-                    if settings.live_alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
+                    if settings.alerts_enabled and settings.live_alerts_enabled and inTimeFilter and (settings.bias == "Neutral" or settings.bias == "Bearish")
                         alert(BuildAlertMessage(candleSet.settings.htf, false, true, "Candle 2"), alert.freq_once_per_bar)
                 
                 // C2 still forming: rebuild liquidity from the C2 extreme so far (locks when C2 closes)
@@ -1762,7 +2077,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.liq_end_time := isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : (time_close(candleSet.settings.htf) + timeframe.in_seconds(candleSet.settings.htf) * 1000)
                         TrySetEntryZoneC3(setup)
                         // Confirmed alert for bearish CISD trigger (post-C2 = already confirmed)
-                        if settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
+                        if settings.alerts_enabled and model_alerts_input and (settings.bias == "Neutral" or settings.bias == "Bearish")
                             alert(BuildAlertMessage(candleSet.settings.htf, false, false, "Candle 2"), alert.freq_once_per_bar)
                     // C2-C3 SMT while C3 is forming (skip the C3-close bar — trackers already rolled)
                     if not isNewHTFCandle
@@ -1853,7 +2168,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.proj_anchor_1 := math.min(open[extreme_lookback], close[extreme_lookback])
                         setup.proj_anchor_0 := math.max(open[cisd_lookback], close[cisd_lookback])
                     // Live/Potential alert for bullish CISD trigger
-                    if settings.live_alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
+                    if settings.alerts_enabled and settings.live_alerts_enabled and inTimeFilter and (settings.bias == "Neutral" or settings.bias == "Bullish")
                         alert(BuildAlertMessage(candleSet.settings.htf, true, true, "Candle 2"), alert.freq_once_per_bar)
                 
                 // C2 still forming: rebuild liquidity from the C2 extreme so far (locks when C2 closes)
@@ -1980,7 +2295,7 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         setup.liq_end_time := isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : (time_close(candleSet.settings.htf) + timeframe.in_seconds(candleSet.settings.htf) * 1000)
                         TrySetEntryZoneC3(setup)
                         // Confirmed alert for bullish CISD trigger (post-C2 = already confirmed)
-                        if settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
+                        if settings.alerts_enabled and model_alerts_input and (settings.bias == "Neutral" or settings.bias == "Bullish")
                             alert(BuildAlertMessage(candleSet.settings.htf, true, false, "Candle 2"), alert.freq_once_per_bar)
                     // C2-C3 SMT while C3 is forming (skip the C3-close bar — trackers already rolled)
                     if not isNewHTFCandle
@@ -2002,14 +2317,19 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                 
                 if not setup.is_post_c2
                     // C2 just closed - check confirmation using C2's actual close (previous bar)
+                    // Time filter: the model must be found (C3 opens) inside an enabled window
                     bool c2_confirmed = close[1] < setup.sweep_price
-                    if c2_confirmed
+                    if c2_confirmed and inTimeFilter
                         // Start post-C2 tracking
                         setup.is_post_c2 := true
                         setup.is_confirmed := true  // Lock in confirmation status
                         setup.ltf_end_idx := bar_index  // Lock sweep line end at C3 start
                         setup.c2_extreme := candleSet.candles.first().h  // C2's high for price limit
                         setup.c2_mid := (candleSet.candles.first().h + candleSet.candles.first().l) / 2.0
+                        setup.c2_open := candleSet.candles.first().o
+                        setup.c2_close := candleSet.candles.first().c
+                        setup.c2_h := candleSet.candles.first().h
+                        setup.c2_l := candleSet.candles.first().l
                         setup.c3_open := open
                         setup.ez_c3_left_time := time
                         TrySetEntryZoneC3(setup)
@@ -2018,10 +2338,10 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         // Note: Even if CISD triggered during C2, continue to post-C2 tracking
                         // to check for invalidation during C3. Will push to history at C3 close.
                         // Confirmed alert if CISD already triggered during C2
-                        if setup.cisd_triggered and settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bearish")
+                        if setup.cisd_triggered and settings.alerts_enabled and model_alerts_input and (settings.bias == "Neutral" or settings.bias == "Bearish")
                             alert(BuildAlertMessage(candleSet.settings.htf, false, false, "Candle 2"), alert.freq_once_per_bar)
                     else
-                        // Sweep not confirmed at C2 close - remove
+                        // Sweep not confirmed at C2 close (or outside the time filter) - remove
                         candleSet.has_live_bearish := false
                 else
                     // Post-C2 phase: C3 just closed (htf_count >= 2)
@@ -2048,6 +2368,9 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                             // C4 entry zone at C4 open (this bar); C3 candle is still first() before unshift
                             int ez_c4_right = isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : time_close(candleSet.settings.htf)
                             TrySetEntryZoneC4(setup, candleSet.candles.first().h, candleSet.candles.first().l, open, time, ez_c4_right)
+                            // Candle 4 (continuation) alert
+                            if settings.alerts_enabled and model_alerts_input and (settings.bias == "Neutral" or settings.bias == "Bearish")
+                                alert(BuildAlertMessage(candleSet.settings.htf, false, false, "Candle 4"), alert.freq_once_per_bar)
                             candleSet.setups.unshift(setup)
                         candleSet.has_live_bearish := false
         
@@ -2060,14 +2383,19 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                 
                 if not setup.is_post_c2
                     // C2 just closed - check confirmation using C2's actual close (previous bar)
+                    // Time filter: the model must be found (C3 opens) inside an enabled window
                     bool c2_confirmed = close[1] > setup.sweep_price
-                    if c2_confirmed
+                    if c2_confirmed and inTimeFilter
                         // Start post-C2 tracking
                         setup.is_post_c2 := true
                         setup.is_confirmed := true  // Lock in confirmation status
                         setup.ltf_end_idx := bar_index  // Lock sweep line end at C3 start
                         setup.c2_extreme := candleSet.candles.first().l  // C2's low for price limit
                         setup.c2_mid := (candleSet.candles.first().h + candleSet.candles.first().l) / 2.0
+                        setup.c2_open := candleSet.candles.first().o
+                        setup.c2_close := candleSet.candles.first().c
+                        setup.c2_h := candleSet.candles.first().h
+                        setup.c2_l := candleSet.candles.first().l
                         setup.c3_open := open
                         setup.ez_c3_left_time := time
                         TrySetEntryZoneC3(setup)
@@ -2076,10 +2404,10 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                         // Note: Even if CISD triggered during C2, continue to post-C2 tracking
                         // to check for invalidation during C3. Will push to history at C3 close.
                         // Confirmed alert if CISD already triggered during C2
-                        if setup.cisd_triggered and settings.alerts_enabled and (settings.bias == "Neutral" or settings.bias == "Bullish")
+                        if setup.cisd_triggered and settings.alerts_enabled and model_alerts_input and (settings.bias == "Neutral" or settings.bias == "Bullish")
                             alert(BuildAlertMessage(candleSet.settings.htf, true, false, "Candle 2"), alert.freq_once_per_bar)
                     else
-                        // Sweep not confirmed at C2 close - remove
+                        // Sweep not confirmed at C2 close (or outside the time filter) - remove
                         candleSet.has_live_bullish := false
                 else
                     // Post-C2 phase: C3 just closed (htf_count >= 2)
@@ -2106,6 +2434,9 @@ method Monitor(CandleSet candleSet, bool isNewHTFCandleArg) =>
                             // C4 entry zone at C4 open (this bar); C3 candle is still first() before unshift
                             int ez_c4_right_bull = isQuarterlyMode() ? (time + getQuarterlyDurationSeconds(candleSet.settings.htf) * 1000) : time_close(candleSet.settings.htf)
                             TrySetEntryZoneC4(setup, candleSet.candles.first().h, candleSet.candles.first().l, open, time, ez_c4_right_bull)
+                            // Candle 4 (continuation) alert
+                            if settings.alerts_enabled and model_alerts_input and (settings.bias == "Neutral" or settings.bias == "Bullish")
+                                alert(BuildAlertMessage(candleSet.settings.htf, true, false, "Candle 4"), alert.freq_once_per_bar)
                             candleSet.setups.unshift(setup)
                         candleSet.has_live_bullish := false
         
@@ -2526,7 +2857,7 @@ method DrawSetups(CandleSet candleSet) =>
                             bin.PutLine(htf_eq4_x1, setup.c3_mid, htf_eq4_x2, setup.c3_mid,
                                 xloc.bar_index, extend.none, htf_eq4_col, eq_htf_style, prev_eq_width)
                 
-                // ==== LAYER 8: ENTRY ZONE C3 - SKIP if invalid ====
+                // ==== LAYER 8: ENTRY ZONE C3 (T-Spot) - SKIP if invalid ====
                 // Label: bearish = top-left of box (label_down), bullish = bottom-left (label_up) — same gap style as C2; one candle right of left edge
                 // Zone right edge develops with LTF bars, then locks at C3 end
                 if not setup.is_invalid and setup.ez_c3_set and not na(setup.ez_c3_left_time)
@@ -2534,6 +2865,8 @@ method DrawSetups(CandleSet candleSet) =>
                         color ez_col = setup.is_bullish ? settings.entry_zone_bull_color : settings.entry_zone_bear_color
                         int ez_right = EntryZoneRight(setup.ez_c3_right_time)
                         bin.PutTimeBox(setup.ez_c3_left_time, setup.ez_c3_top, ez_right, setup.ez_c3_bot, ez_col, color_transparent, 0)
+                        if tspot_debug and not na(setup.ts3)
+                            bin.PutLabel(setup.ez_c3_left_time, (setup.ez_c3_top + setup.ez_c3_bot) / 2.0, TSpotDebugText(setup.ts3, "C3 T-Spot"), xloc.bar_time, color.new(color.gray, 85), color.black, label.style_label_left, size.small)
                     if settings.show_c3_lbl
                         float ez_lbl_y = setup.is_bullish ? setup.ez_c3_bot : setup.ez_c3_top
                         int ez_lbl_x = setup.ez_c3_left_time + timeframe.in_seconds() * 1000
@@ -2541,13 +2874,15 @@ method DrawSetups(CandleSet candleSet) =>
                         bin.PutLabel(ez_lbl_x, ez_lbl_y, "C3", xloc.bar_time,
                             color_transparent, settings.c2_color, lbl_style_ez, settings.c2_size)
                 
-                // ==== LAYER 9: ENTRY ZONE C4 — zone removed if invalidated; label becomes xC4 ====
+                // ==== LAYER 9: ENTRY ZONE C4 (T-Spot) — zone removed if invalidated; label becomes xC4 ====
                 // Zone right edge develops with LTF bars, then locks at C4 end
                 if not setup.is_invalid and setup.ez_c4_set and not na(setup.ez_c4_left_time)
                     color ez4_col = setup.is_bullish ? settings.entry_zone_bull_color : settings.entry_zone_bear_color
                     int ez4_right = EntryZoneRight(setup.ez_c4_right_time)
                     if settings.entry_zone_show and not setup.ez_c4_invalid
                         bin.PutTimeBox(setup.ez_c4_left_time, setup.ez_c4_top, ez4_right, setup.ez_c4_bot, ez4_col, color_transparent, 0)
+                        if tspot_debug and not na(setup.ts4)
+                            bin.PutLabel(setup.ez_c4_left_time, (setup.ez_c4_top + setup.ez_c4_bot) / 2.0, TSpotDebugText(setup.ts4, "C4 T-Spot"), xloc.bar_time, color.new(color.gray, 85), color.black, label.style_label_left, size.small)
                     if settings.show_c4_lbl
                         float ez4_lbl_y = setup.is_bullish ? setup.ez_c4_bot : setup.ez_c4_top
                         int ez4_lbl_x = setup.ez_c4_left_time + timeframe.in_seconds() * 1000
@@ -2567,6 +2902,9 @@ method DrawSetups(CandleSet candleSet) =>
         if not has_live
             continue
         setup = is_bull ? candleSet.live_bullish : candleSet.live_bearish
+        // Time filter: a developing C2 is only shown while inside an enabled window
+        if not setup.is_post_c2 and not inTimeFilter
+            continue
         // Live on: developing C2 (sweep back in or post-C2). Live off: only after C2 close + CISD printed.
         if settings.sweep_live
             if not (setup.is_confirmed or setup.is_post_c2)
@@ -2693,7 +3031,7 @@ method DrawSetups(CandleSet candleSet) =>
                     bin.PutLine(htf_eq4_x1_l, setup.c3_mid, htf_eq4_x2_l, setup.c3_mid,
                         xloc.bar_index, extend.none, htf_eq4_col_l, eq_htf_style_live, prev_eq_width)
         
-        // ==== LAYER 8: ENTRY ZONE C3 - SKIP if invalid ====
+        // ==== LAYER 8: ENTRY ZONE C3 (T-Spot) - SKIP if invalid ====
         // Label: bearish = top-left of box (label_down), bullish = bottom-left (label_up) — same gap style as C2
         // Zone right edge develops with LTF bars (option A), then locks at C3 end
         if not setup.is_invalid and setup.ez_c3_set and not na(setup.ez_c3_left_time)
@@ -2701,6 +3039,8 @@ method DrawSetups(CandleSet candleSet) =>
                 color ez_col_live = is_bull ? settings.entry_zone_bull_color : settings.entry_zone_bear_color
                 int ez_right_live = EntryZoneRight(setup.ez_c3_right_time)
                 bin.PutTimeBox(setup.ez_c3_left_time, setup.ez_c3_top, ez_right_live, setup.ez_c3_bot, ez_col_live, color_transparent, 0)
+                if tspot_debug and not na(setup.ts3)
+                    bin.PutLabel(setup.ez_c3_left_time, (setup.ez_c3_top + setup.ez_c3_bot) / 2.0, TSpotDebugText(setup.ts3, "C3 T-Spot"), xloc.bar_time, color.new(color.gray, 85), color.black, label.style_label_left, size.small)
             if settings.show_c3_lbl
                 float ez_lbl_y_live = is_bull ? setup.ez_c3_bot : setup.ez_c3_top
                 // One chart candle right of box left edge (same rule for C4 later)
@@ -2841,85 +3181,315 @@ if valid_htf
     // HTF candle updates - always run every tick
     htf.Update()
 
+// ---- Alert conditions (pick these in TradingView's "Add Alert" dialog instead of "Any alert() function call") ----
+bool al_bull_early = false
+bool al_bull_conf  = false
+bool al_bear_early = false
+bool al_bear_conf  = false
+if valid_htf and htf.has_live_bullish
+    Setup al_b = htf.live_bullish
+    al_bull_early := al_b.cisd_triggered and not al_b.is_post_c2
+    al_bull_conf  := al_b.cisd_triggered and al_b.is_post_c2
+if valid_htf and htf.has_live_bearish
+    Setup al_s = htf.live_bearish
+    al_bear_early := al_s.cisd_triggered and not al_s.is_post_c2
+    al_bear_conf  := al_s.cisd_triggered and al_s.is_post_c2
+
+var bool al_prev_bull_early = false
+var bool al_prev_bull_conf  = false
+var bool al_prev_bear_early = false
+var bool al_prev_bear_conf  = false
+bool al_bull_early_fire = al_bull_early and not al_prev_bull_early
+bool al_bull_conf_fire  = al_bull_conf and not al_prev_bull_conf
+bool al_bear_early_fire = al_bear_early and not al_prev_bear_early
+bool al_bear_conf_fire  = al_bear_conf and not al_prev_bear_conf
+al_prev_bull_early := al_bull_early
+al_prev_bull_conf  := al_bull_conf
+al_prev_bear_early := al_bear_early
+al_prev_bear_conf  := al_bear_conf
+
+bool al_bull_side = settings.bias == 'Neutral' or settings.bias == 'Bullish'
+bool al_bear_side = settings.bias == 'Neutral' or settings.bias == 'Bearish'
+alertcondition(al_bull_early_fire and settings.alerts_enabled and settings.live_alerts_enabled and inTimeFilter and not settings.hide_setups and al_bull_side, title = 'Bullish Early CISD', message = 'Bullish Early CISD on {{ticker}} ({{interval}})')
+alertcondition(al_bear_early_fire and settings.alerts_enabled and settings.live_alerts_enabled and inTimeFilter and not settings.hide_setups and al_bear_side, title = 'Bearish Early CISD', message = 'Bearish Early CISD on {{ticker}} ({{interval}})')
+alertcondition(al_bull_conf_fire and settings.alerts_enabled and model_alerts_input and not settings.hide_setups and al_bull_side, title = 'Bullish CISD Confirmed', message = 'Bullish CISD Confirmed on {{ticker}} ({{interval}})')
+alertcondition(al_bear_conf_fire and settings.alerts_enabled and model_alerts_input and not settings.hide_setups and al_bear_side, title = 'Bearish CISD Confirmed', message = 'Bearish CISD Confirmed on {{ticker}} ({{interval}})')
+
 // Drawing (only on last bar)
 if barstate.islast or barstate.isrealtime
     bin.BeginFrame()
     if valid_htf
         htf.DrawAll(offset)
     bin.EndFrame()
+
 // ============================================================================
-// MINIMAL DASHBOARD (text only, no box) - paste ONCE at the VERY BOTTOM
+// ADR / CDR + PDH / PDL DATA  (New York trading day, same on every broker)
 // ============================================================================
 
-// ---- Settings (appear under "Dashboard" in the indicator settings) ----
-string mdash_group = "Dashboard  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-mdash_show  = input.bool(true, 'Show Dashboard', group = mdash_group)
-mdash_pos   = input.string(position.bottom_right, 'Position', options = [position.bottom_right, position.bottom_left, position.bottom_center, position.top_right, position.top_left, position.top_center], group = mdash_group)
-mdash_size  = input.string(size.small, 'Text Size', options = [size.tiny, size.small, size.normal], group = mdash_group)
-mdash_color = input.color(color.rgb(0, 0, 0), 'Text Color', group = mdash_group)
+// Symbol kind: used for the ADR / CDR unit (forex in pips, the rest in price points) and for the trading day
+adrTicker   = str.upper(syminfo.ticker)
+adrIsMetal  = str.startswith(adrTicker, 'XAU') or str.startswith(adrTicker, 'XAG') or str.startswith(adrTicker, 'XPT') or str.startswith(adrTicker, 'XPD')
+adrHasDigit = str.contains(adrTicker, '0') or str.contains(adrTicker, '1') or str.contains(adrTicker, '2') or str.contains(adrTicker, '3') or str.contains(adrTicker, '4') or str.contains(adrTicker, '5') or str.contains(adrTicker, '6') or str.contains(adrTicker, '7') or str.contains(adrTicker, '8') or str.contains(adrTicker, '9')
+adrIsFx     = not adrIsMetal and (syminfo.type == 'forex' or (syminfo.type == 'cfd' and str.length(adrTicker) == 6 and not adrHasDigit))
+adrPip      = str.contains(adrTicker, 'JPY') ? 0.01 : 0.0001
 
-// Countdown is one size larger than the other lines
-string mdash_timer_size = mdash_size == size.tiny ? size.normal : mdash_size == size.small ? size.large : size.huge
+// Trading day in New York time: forex starts 17:00, indices, metals and the rest 18:00.
+// Crypto trades 24/7 and keeps the symbol's own daily candle.
+dayIsCrypto = syminfo.type == 'crypto'
+dayStartH   = adrIsFx ? 17 : 18
 
-// ---- Countdown (always HH:MM:SS, e.g. 00:29:00) ----
+nyNewDay(simple int h, simple bool crypto) =>
+    int off = (24 - h) * 3600000
+    crypto ? timeframe.change('1D') : not na(time[1]) and dayofmonth(time + off, 'America/New_York') != dayofmonth(time[1] + off, 'America/New_York')
+
+string adr_group = "ADR / CDR  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+adrShow = input.bool(true, 'Show in Info Table', group = adr_group, inline = 'adrtbl')
+adrLen  = input.int(14, 'Length', minval = 1, maxval = 100, group = adr_group, inline = 'adrtbl', tooltip = "ADR = average high-low of this many completed days (today excluded). CDR = today's high-low so far, with its share of ADR. A day starts 18:00 New York (forex 17:00), on every broker. Forex in pips, the rest in price points.")
+
+// Built from 1H bars so it does not depend on chart history.
+// Returns ADR, today's high / low so far, and the previous day's high / low.
+adrReq(simple int len, simple int h, simple bool crypto) =>
+    var float dH = na
+    var float dL = na
+    var float pH = na
+    var float pL = na
+    var array<float> ranges = array.new_float()
+    if nyNewDay(h, crypto)
+        if not na(dH)
+            ranges.push(dH - dL)
+            if ranges.size() > len
+                ranges.shift()
+            pH := dH
+            pL := dL
+        dH := high
+        dL := low
+    else
+        dH := na(dH) ? high : math.max(dH, high)
+        dL := na(dL) ? low : math.min(dL, low)
+    float adr = ranges.size() == len ? ranges.avg() : na
+    [adr, dH, dL, pH, pL]
+
+// Same day logic for the SMT pairs: previous day's high / low and today's high / low so far
+pdReq(simple int h, simple bool crypto) =>
+    var float dH = na
+    var float dL = na
+    var float pH = na
+    var float pL = na
+    if nyNewDay(h, crypto)
+        if not na(dH)
+            pH := dH
+            pL := dL
+        dH := high
+        dL := low
+    else
+        dH := na(dH) ? high : math.max(dH, high)
+        dL := na(dL) ? low : math.min(dL, low)
+    [pH, pL, dH, dL]
+
+[adrVal, adrDayH, adrDayL, pdhCur, pdlCur] = request.security(syminfo.tickerid, '60', adrReq(adrLen, dayStartH, dayIsCrypto), lookahead = barmerge.lookahead_on, calc_bars_count = 5000)
+
+// PDH / PDL inputs
+string pd_group = "PDH / PDL (SMT Pairs)  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+pd_show_input   = input.bool(true, 'Show PDH / PDL', group = pd_group, tooltip = 'Shows which symbols (this chart + the SMT pairs, automatic or manual) have taken the previous day high / low today. A dot = taken, empty = not taken. An inverse pair is compared the opposite way (its high against your low).')
+pd_grid_input   = input.bool(false, 'Grid?', group = pd_group, inline = 'pd1')
+pd_pos_input    = input.string(position.top_right, 'Position', options = [position.top_right, position.top_left, position.top_center, position.middle_right, position.middle_left, position.bottom_right, position.bottom_left, position.bottom_center], group = pd_group)
+pd_size_input   = input.string(size.small, 'Text Size', options = [size.tiny, size.small, size.normal], group = pd_group)
+pd_color_input  = input.color(color.rgb(0, 0, 0), 'Text Color', group = pd_group)
+
+GetPdData(string symbol, bool enabled) =>
+    if enabled and symbol != ""
+        request.security(symbol, '60', pdReq(dayStartH, dayIsCrypto), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true, calc_bars_count = 5000)
+    else
+        [float(na), float(na), float(na), float(na)]
+
+[pd1_pH, pd1_pL, pd1_dH, pd1_dL] = GetPdData(smt_sym1_resolved, pd_show_input)
+[pd2_pH, pd2_pL, pd2_dH, pd2_dL] = GetPdData(smt_sym2_resolved, pd_show_input and smt_sym2_enable_input)
+[pd3_pH, pd3_pL, pd3_dH, pd3_dL] = GetPdData(smt_sym3_resolved, pd_show_input and smt_sym3_enable_input)
+
+// Taken today? (isHigh: PDH row, else PDL row). An inverse pair is flipped.
+PdTaken(float pH, float pL, float dH, float dL, bool inv, bool isHigh) =>
+    bool r = false
+    if not na(pH) and not na(pL) and not na(dH) and not na(dL)
+        if isHigh
+            r := inv ? dL < pL : dH > pH
+        else
+            r := inv ? dH > pH : dL < pL
+    r
+
+// NQ1! -> NQ
+PdName(string t) =>
+    str.replace(t, "1!", "")
+
+var table pd_table = na
+if barstate.islast
+    if not na(pd_table)
+        table.delete(pd_table)
+        pd_table := na
+    if pd_show_input
+        array<string> pd_names = array.from(PdName(syminfo.ticker))
+        array<bool> pd_hi = array.from(PdTaken(pdhCur, pdlCur, adrDayH, adrDayL, false, true))
+        array<bool> pd_lo = array.from(PdTaken(pdhCur, pdlCur, adrDayH, adrDayL, false, false))
+        if smt_sym1_resolved != ""
+            pd_names.push(PdName(smt_sym1_ticker))
+            pd_hi.push(PdTaken(pd1_pH, pd1_pL, pd1_dH, pd1_dL, smt_sym1_inverse, true))
+            pd_lo.push(PdTaken(pd1_pH, pd1_pL, pd1_dH, pd1_dL, smt_sym1_inverse, false))
+        if smt_sym2_enable_input and smt_sym2_resolved != ""
+            pd_names.push(PdName(smt_sym2_ticker))
+            pd_hi.push(PdTaken(pd2_pH, pd2_pL, pd2_dH, pd2_dL, smt_sym2_inverse, true))
+            pd_lo.push(PdTaken(pd2_pH, pd2_pL, pd2_dH, pd2_dL, smt_sym2_inverse, false))
+        if smt_sym3_enable_input and smt_sym3_resolved != ""
+            pd_names.push(PdName(smt_sym3_ticker))
+            pd_hi.push(PdTaken(pd3_pH, pd3_pL, pd3_dH, pd3_dL, smt_sym3_inverse, true))
+            pd_lo.push(PdTaken(pd3_pH, pd3_pL, pd3_dH, pd3_dL, smt_sym3_inverse, false))
+        int pd_n = pd_names.size()
+        pd_table := table.new(pd_pos_input, pd_n + 1, 3, bgcolor = na, frame_color = na, frame_width = 0, border_color = pd_grid_input ? color.new(pd_color_input, 60) : na, border_width = pd_grid_input ? 1 : 0)
+        table.cell(pd_table, 0, 0, "", text_color = pd_color_input, text_size = pd_size_input, text_halign = text.align_center, text_font_family = font.family_monospace)
+        table.cell(pd_table, 0, 1, "PDH", text_color = pd_color_input, text_size = pd_size_input, text_halign = text.align_center, text_font_family = font.family_monospace)
+        table.cell(pd_table, 0, 2, "PDL", text_color = pd_color_input, text_size = pd_size_input, text_halign = text.align_center, text_font_family = font.family_monospace)
+        for pd_k = 0 to pd_n - 1
+            table.cell(pd_table, pd_k + 1, 0, pd_names.get(pd_k), text_color = pd_color_input, text_size = pd_size_input, text_halign = text.align_center, text_font_family = font.family_monospace)
+            table.cell(pd_table, pd_k + 1, 1, pd_hi.get(pd_k) ? "●" : "", text_color = pd_color_input, text_size = pd_size_input, text_halign = text.align_center, text_font_family = font.family_monospace)
+            table.cell(pd_table, pd_k + 1, 2, pd_lo.get(pd_k) ? "●" : "", text_color = pd_color_input, text_size = pd_size_input, text_halign = text.align_center, text_font_family = font.family_monospace)
+
+// ============================================================================
+// INFO TABLE (rows can be checked / unchecked)
+// ============================================================================
+
+string info_group = "Info Table  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+tbl_show       = input.bool(true, 'Show Info?', group = info_group, inline = 'info')
+tbl_style      = input.string('Text', '', options = ['Table', 'Text'], group = info_group, inline = 'info')
+tbl_text_size  = input.string('Small', '', options = ['Tiny', 'Small', 'Normal', 'Large'], group = info_group, inline = 'info')
+tbl_border     = input.bool(false, 'Border?', group = info_group, inline = 'info', tooltip = 'Table: with a background. Text: text only. Border?: a frame around it.\n\nRows: symbol (timeframe), model, time to close, bias, time filter (only when it is on), SMT pairs, ADR + CDR %, date.')
+tbl_pos_vert   = input.string('Bottom', 'Table Location', options = ['Top', 'Middle', 'Bottom'], group = info_group, inline = 'tblpos')
+tbl_pos_horiz  = input.string('Right', '', options = ['Left', 'Center', 'Right'], group = info_group, inline = 'tblpos')
+tbl_asset      = input.bool(true, 'Asset', group = info_group, inline = 'r1')
+tbl_ctf        = input.bool(true, 'Chart Timeframe', group = info_group, inline = 'r1')
+tbl_fractal    = input.bool(true, 'Fractal', group = info_group, inline = 'r2')
+tbl_ttc        = input.bool(true, 'Time to Close', group = info_group, inline = 'r2')
+tbl_bias       = input.bool(true, 'Bias', group = info_group, inline = 'r3')
+tbl_tfilter    = input.bool(true, 'Time Filter', group = info_group, inline = 'r3')
+tbl_smt        = input.bool(true, 'SMT Ticker(s)', group = info_group, inline = 'r4')
+tbl_date       = input.bool(false, 'Date', group = info_group, inline = 'r4')
+tbl_bg_color   = input.color(#ffffff, 'Colors', group = info_group, inline = 'tblclr')
+tbl_text_color = input.color(color.rgb(0, 0, 0), '', group = info_group, inline = 'tblclr')
+
+tablePosition(string vert, string horz) =>
+    switch vert + '-' + horz
+        'Top-Left'      => position.top_left
+        'Top-Center'    => position.top_center
+        'Top-Right'     => position.top_right
+        'Middle-Left'   => position.middle_left
+        'Middle-Center' => position.middle_center
+        'Middle-Right'  => position.middle_right
+        'Bottom-Left'   => position.bottom_left
+        'Bottom-Center' => position.bottom_center
+        'Bottom-Right'  => position.bottom_right
+        =>                 position.top_right
+
+biggerSize(string s) =>
+    switch s
+        'Tiny'   => size.small
+        'Small'  => size.normal
+        'Normal' => size.large
+        =>          size.huge
+
+// 01:00:00 style countdown (hours always shown)
+formatHms(int ms) =>
+    totalSec = int(math.max(ms, 0) / 1000)
+    dd = int(totalSec / 86400)
+    hh = int((totalSec % 86400) / 3600)
+    mm = int((totalSec % 3600) / 60)
+    ss = int(totalSec % 60)
+    (dd > 0 ? str.tostring(dd) + 'd ' : '') + pad2(hh) + ':' + pad2(mm) + ':' + pad2(ss)
+
+// Close time of the forming HTF candle. Intraday timeframes use open time + length; daily and above use time_close()
+htfCloseTime(string tf) =>
+    int sec = timeframe.in_seconds(tf)
+    sec < 86400 ? time(tf) + sec * 1000 : time_close(tf)
+
+fmtPts(float v) =>
+    adrIsFx ? str.tostring(v / adrPip, '#.0') + ' pips' : str.tostring(v, format.mintick) + ' pts'
+
+// ---- Countdown (HH:MM:SS) ----
 MdashTimer(string HTF) =>
     string r = 'n/a'
     if str.startswith(HTF, "SESSION_")
         r := RemainingTime(HTF)
-    else if barstate.isrealtime
-        int secs = int(math.max(0, (time_close(HTF) - timenow) / 1000))
-        int hh = math.floor(secs / 3600)
-        int mm = math.floor((secs - hh * 3600) / 60)
-        int ss = secs - hh * 3600 - mm * 60
-        r := str.tostring(hh, '00') + ':' + str.tostring(mm, '00') + ':' + str.tostring(ss, '00')
+    else
+        r := formatHms(int(htfCloseTime(HTF) - (barstate.isrealtime ? timenow : time_close)))
     r
 
-// ---- Table (no background, no border, no frame) ----
-var table mdash_table = table.new(
-     mdash_pos, 1, 5,
-     bgcolor = na, frame_color = na, frame_width = 0,
-     border_color = na, border_width = 0)
+var table infoTbl = na
+if barstate.islast
+    array<string> info_rows = array.new<string>()
+    array<color>  info_clrs = array.new<color>()
+    array<string> info_szs  = array.new<string>()
+    string info_sz  = LabelSize(tbl_text_size)
+    color  info_dim = color.new(tbl_text_color, 45)
 
-// ---- Draw ----
-if mdash_show and valid_htf and (barstate.islast or barstate.isrealtime)
+    // Row: ES1! (1H)
+    string info_head = tbl_asset ? syminfo.ticker : ''
+    if tbl_ctf
+        info_head := info_head == '' ? LTFName() : info_head + ' (' + LTFName() + ')'
+    if info_head != ''
+        info_rows.push(info_head)
+        info_clrs.push(tbl_text_color)
+        info_szs.push(info_sz)
+    // Row: 1H-1D Model
+    if tbl_fractal
+        info_rows.push(valid_htf ? LTFName() + "-" + HTFName(htf.settings.htf) + " Model" : 'No Model')
+        info_clrs.push(valid_htf ? tbl_text_color : info_dim)
+        info_szs.push(info_sz)
+    // Row: countdown (larger)
+    if tbl_ttc and valid_htf
+        info_rows.push(MdashTimer(htf.settings.htf))
+        info_clrs.push(tbl_text_color)
+        info_szs.push(biggerSize(tbl_text_size))
+    // Row: Bias
+    if tbl_bias
+        info_rows.push('Bias: ' + settings.bias)
+        info_clrs.push(settings.bias == 'Bullish' ? settings.cisd_bull_color : settings.bias == 'Bearish' ? settings.cisd_bear_color : tbl_text_color)
+        info_szs.push(info_sz)
+    // Row: Time filter (only when it is on)
+    if tbl_tfilter and useTimeFilter
+        info_rows.push('Filter: ' + (not timeFilterActive ? 'not used' : inTimeFilter ? 'open' : 'closed'))
+        info_clrs.push(timeFilterActive and inTimeFilter ? tbl_text_color : info_dim)
+        info_szs.push(info_sz)
+    // Row: SMT(Auto): MES1!, MNQ1!
+    if tbl_smt
+        string info_smt = "SMT: Off"
+        if smt_show_input
+            string info_syms = smt_sym1_ticker
+            if smt_sym2_enable_input and smt_sym2_ticker != ""
+                info_syms := info_syms + ", " + smt_sym2_ticker
+            if smt_sym3_enable_input and smt_sym3_ticker != ""
+                info_syms := info_syms + ", " + smt_sym3_ticker
+            info_smt := "SMT(" + (smt_mode_input == 'Automatic' ? "Auto" : "Manual") + "): " + info_syms
+        info_rows.push(info_smt)
+        info_clrs.push(smt_show_input ? tbl_text_color : info_dim)
+        info_szs.push(info_sz)
+    // Row: ADR 655.3 pts · 62%  (the % is today's range, CDR, as a share of ADR)
+    if adrShow and not na(adrVal) and adrVal > 0 and not na(adrDayH) and not na(adrDayL)
+        info_rows.push('ADR ' + fmtPts(adrVal) + ' · ' + str.tostring((adrDayH - adrDayL) / adrVal * 100, '0') + '%')
+        info_clrs.push(tbl_text_color)
+        info_szs.push(info_sz)
+    // Row: Date
+    if tbl_date
+        info_rows.push(str.format_time(time_close, 'MMM dd yyyy', syminfo.timezone))
+        info_clrs.push(tbl_text_color)
+        info_szs.push(info_sz)
 
-    // SMT line, e.g. SMT(Auto): MES1!, MNQ1!
-    string mdash_smt = "SMT: Off"
-    if smt_show_input
-        string mdash_syms = smt_sym1_ticker
-        if smt_sym2_enable_input and smt_sym2_ticker != ""
-            mdash_syms := mdash_syms + ", " + smt_sym2_ticker
-        // [SMT3]
-        if smt_sym3_enable_input and smt_sym3_ticker != ""
-            mdash_syms := mdash_syms + ", " + smt_sym3_ticker
-        mdash_smt := "SMT(" + (smt_mode_input == 'Automatic' ? "Auto" : "Manual") + "): " + mdash_syms
+    if not na(infoTbl)
+        table.delete(infoTbl)
+        infoTbl := na
+    if tbl_show and info_rows.size() > 0
+        color info_bg = tbl_style == 'Text' ? na : tbl_bg_color
+        infoTbl := table.new(tablePosition(tbl_pos_vert, tbl_pos_horiz), 1, info_rows.size(), bgcolor = info_bg, border_color = na, border_width = 0, frame_color = tbl_border ? color.new(tbl_text_color, 75) : na, frame_width = tbl_border ? 1 : 0)
+        for r = 0 to info_rows.size() - 1
+            table.cell(infoTbl, 0, r, info_rows.get(r), text_color = info_clrs.get(r), bgcolor = info_bg, text_size = info_szs.get(r), text_halign = text.align_center, text_font_family = font.family_monospace, text_formatting = r == 0 and info_head != '' ? text.format_bold : text.format_none)
 
-    // Row 0: ticker and chart timeframe
-    table.cell(mdash_table, 0, 0, syminfo.ticker + " (" + LTFName() + ")",
-         text_color = mdash_color, text_size = mdash_size,
-         text_halign = text.align_center, text_font_family = font.family_monospace)
-
-    // Row 1: model
-    table.cell(mdash_table, 0, 1, LTFName() + "-" + HTFName(htf.settings.htf) + " Model",
-         text_color = mdash_color, text_size = mdash_size,
-         text_halign = text.align_center, text_font_family = font.family_monospace)
-
-    // Row 2: countdown (larger)
-    table.cell(mdash_table, 0, 2, MdashTimer(htf.settings.htf),
-         text_color = mdash_color, text_size = mdash_timer_size,
-         text_halign = text.align_center, text_font_family = font.family_monospace)
-
-    // Row 3: bias
-    table.cell(mdash_table, 0, 3, "Bias: " + settings.bias,
-         text_color = mdash_color, text_size = mdash_size,
-         text_halign = text.align_center, text_font_family = font.family_monospace)
-
-    // Row 4: SMT
-    table.cell(mdash_table, 0, 4, mdash_smt,
-         text_color = mdash_color, text_size = mdash_size,
-         text_halign = text.align_center, text_font_family = font.family_monospace)
-         // ============================================================================
-// NAME TEXT (no box, no border) - paste at the VERY BOTTOM, below the dashboard
+// ============================================================================
+// NAME TEXT (no box, no border)
 // ============================================================================
 
 string mname_group = "Name  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -2939,8 +3509,9 @@ if barstate.islast
          bgcolor = na,
          text_color = mname_color, text_size = mname_size,
          text_halign = text.align_center, text_font_family = font.family_monospace)
-         // ============================================================================
-// PSP v3 (with +PSP tags beside C2 / C3 / C4) - paste ONCE at the VERY BOTTOM
+
+// ============================================================================
+// PSP v3 (with +PSP tags beside C2 / C3 / C4)
 // ============================================================================
 
 // ---- Settings (appear under "PSP" in the indicator settings) ----
@@ -3083,8 +3654,9 @@ if mpsp_ok and mpsp_tag and not settings.hide_setups and (barstate.islast or bar
             bool lbias_ok = settings.bias == 'Neutral' or (settings.bias == 'Bullish' and is_bull) or (settings.bias == 'Bearish' and not is_bull)
             if lbias_ok and ls.is_post_c2 and ls.cisd_triggered
                 MpspTag(ls)
-                // ============================================================================
-// SECOND HTF CANDLE SET (side by side) - paste ONCE at the VERY BOTTOM
+
+// ============================================================================
+// SECOND HTF CANDLE SET (side by side)
 // ============================================================================
 
 string h2_group = "HTF 2 (Side by Side)  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -3180,3 +3752,102 @@ if h2_valid and (barstate.islast or barstate.isrealtime)
                 h2_lbls.push(label.new(h2_lx, h2_top, h2_txt, xloc.bar_index, color = color_transparent, textcolor = settings.htf_label_color, style = label.style_label_down, size = settings.htf_label_size))
             if settings.label_position == 'Both' or settings.label_position == 'Bottom'
                 h2_lbls.push(label.new(h2_lx, h2_bot, h2_txt, xloc.bar_index, color = color_transparent, textcolor = settings.htf_label_color, style = label.style_label_up, size = settings.htf_label_size))
+
+// ============================================================================
+// THIRD HTF CANDLE SET (side by side, to the right of HTF 2)
+// ============================================================================
+
+string h3_group = "HTF 3 (Side by Side)  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+h3_show     = input.bool(true, 'Show Third HTF', group = h3_group)
+h3_tf       = input.timeframe('1D', 'Timeframe', group = h3_group, tooltip = 'Default 1D. Must be a clean multiple of your chart timeframe.')
+h3_count    = input.int(4, 'Candles', minval = 1, maxval = 20, group = h3_group)
+h3_gap      = input.int(4, 'Gap from previous set (bars)', minval = 0, group = h3_group)
+h3_vt_show  = input.bool(false, 'Vertical Lines', inline = 'h3vt', group = h3_group)
+h3_vt_color = input.color(color.rgb(0, 0, 0, 85), '', inline = 'h3vt', group = h3_group)
+
+bool h3_valid = h3_show and ValidTimeframe(h3_tf)
+string h3_tf_safe = h3_valid ? h3_tf : timeframe.period
+bool h3_chg = ta.change(time(h3_tf_safe)) > 0
+bool h3_new = h3_valid and h3_chg
+int h3_secs = timeframe.in_seconds(h3_tf_safe)
+
+var array<Candle> h3_candles = array.new<Candle>()
+var array<box>    h3_boxes   = array.new<box>()
+var array<line>   h3_lines   = array.new<line>()
+var array<label>  h3_lbls    = array.new<label>()
+
+// ---- Build / update the candles every bar ----
+if h3_valid
+    if h3_new or h3_candles.size() == 0
+        Candle h3_c = Candle.new()
+        h3_c.o := open
+        h3_c.c := close
+        h3_c.h := high
+        h3_c.l := low
+        h3_c.o_time := time
+        h3_c.dow := h3_secs >= 86400 ? str.format_time(time, 'MMM d', 'America/New_York') : str.format_time(time, 'HH:mm', 'America/New_York')
+        h3_candles.unshift(h3_c)
+        if h3_candles.size() > h3_count
+            h3_candles.pop()
+    else
+        Candle h3_cur = h3_candles.first()
+        h3_cur.h := math.max(h3_cur.h, high)
+        h3_cur.l := math.min(h3_cur.l, low)
+        h3_cur.c := close
+
+// ---- Draw (placed to the right of the second set, or of the first set if HTF 2 is off) ----
+if h3_valid and (barstate.islast or barstate.isrealtime)
+    for h3_b in h3_boxes
+        box.delete(h3_b)
+    h3_boxes.clear()
+    for h3_l in h3_lines
+        line.delete(h3_l)
+    h3_lines.clear()
+    for h3_lb in h3_lbls
+        label.delete(h3_lb)
+    h3_lbls.clear()
+
+    int h3_n1   = valid_htf ? htf.candles.size() : 0
+    int h3_n2   = h2_valid ? h2_candles.size() : 0
+    int h3_step = settings.width + 1
+    int h3_base = bar_index + settings.offset + h3_step * h3_n1 + (h2_valid ? h2_gap + h3_step * h3_n2 : 0) + h3_gap
+    int h3_n    = h3_candles.size()
+
+    if h3_n > 0
+        float h3_top = na
+        float h3_bot = na
+        for h3_k = 0 to h3_n - 1
+            Candle h3_cd = h3_candles.get(h3_n - 1 - h3_k)
+            int h3_xl = h3_base + h3_step * h3_k
+            int h3_xr = h3_xl + settings.width
+            int h3_xw = h3_xl + int(settings.width / 2)
+            bool h3_bull = h3_cd.c > h3_cd.o
+            float h3_bt = math.max(h3_cd.o, h3_cd.c)
+            float h3_bb = math.min(h3_cd.o, h3_cd.c)
+            color h3_wc = h3_bull ? settings.bull_wick : settings.bear_wick
+
+            h3_boxes.push(box.new(h3_xl, h3_bt, h3_xr, h3_bb, border_color = h3_bull ? settings.bull_border : settings.bear_border, bgcolor = h3_bull ? settings.bull_body : settings.bear_body, xloc = xloc.bar_index))
+            h3_lines.push(line.new(h3_xw, h3_cd.h, h3_xw, h3_bt, xloc = xloc.bar_index, color = h3_wc, width = 1))
+            h3_lines.push(line.new(h3_xw, h3_bb, h3_xw, h3_cd.l, xloc = xloc.bar_index, color = h3_wc, width = 1))
+
+            if h3_vt_show
+                h3_lines.push(line.new(h3_cd.o_time, h3_cd.h, h3_cd.o_time, h3_cd.l, xloc = xloc.bar_time, extend = extend.both, color = h3_vt_color, width = 1))
+
+            if settings.daily_name and h3_cd.dow != ''
+                if settings.dow_position == 'Both' or settings.dow_position == 'Top'
+                    h3_lbls.push(label.new(h3_xw, h3_cd.h, h3_cd.dow, xloc.bar_index, color = color_transparent, textcolor = settings.dow_color, style = label.style_label_down, size = settings.dow_size))
+                if settings.dow_position == 'Both' or settings.dow_position == 'Bottom'
+                    h3_lbls.push(label.new(h3_xw, h3_cd.l, h3_cd.dow, xloc.bar_index, color = color_transparent, textcolor = settings.dow_color, style = label.style_label_up, size = settings.dow_size))
+
+            h3_top := na(h3_top) ? h3_cd.h : math.max(h3_top, h3_cd.h)
+            h3_bot := na(h3_bot) ? h3_cd.l : math.min(h3_bot, h3_cd.l)
+
+        if settings.htf_label_show
+            string h3_txt = HTFName(h3_tf)
+            if settings.htf_timer_show
+                h3_txt := h3_txt + '\n\n(' + RemainingTime(h3_tf) + ')'
+            int h3_lx = h3_base + int(h3_step * (h3_n - 1) / 2)
+            if settings.label_position == 'Both' or settings.label_position == 'Top'
+                h3_lbls.push(label.new(h3_lx, h3_top, h3_txt, xloc.bar_index, color = color_transparent, textcolor = settings.htf_label_color, style = label.style_label_down, size = settings.htf_label_size))
+            if settings.label_position == 'Both' or settings.label_position == 'Bottom'
+                h3_lbls.push(label.new(h3_lx, h3_bot, h3_txt, xloc.bar_index, color = color_transparent, textcolor = settings.htf_label_color, style = label.style_label_up, size = settings.htf_label_size))

@@ -1,0 +1,26 @@
+Advanced market-structure toolkit featuring **Automatic SMT Selection of SMT Divergence, PDH/PDL Sweep among smt pairs, ADR, FVG, CISD, IC-CISD, Liquidity, and HTF Fractal Analysis**.
+
+Includes **HTF Candle Projections, Previous EQ, T-Spot Entry Zones, Standard Deviation Projections, Session & Bias Filters, and comprehensive alerts**.
+
+All features are following:- 
+- Automatic SMT Selection
+- SMT Divergence
+- PDH/PDL Sweep Check Across SMT Pairs
+- ADR / Developing Daily Range
+- HTF Candles Above the Chart
+- HTF Candle Projection
+- HTF Open / High / Low Levels
+- HTF Vertical Time Separators
+- Previous EQ
+- HTF Fractal / Candle Selection
+- HTF Sweep Model
+- CISD
+- IC-CISD
+- C3 Entry Zone
+- C4 Entry Zone
+- FVG Detection
+- Formation Liquidity
+- Standard Deviation Projections
+- Time & Session Filters
+- Bias Filters
+- SMT / CISD / Model Alerts
